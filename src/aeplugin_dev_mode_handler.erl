@@ -1,4 +1,3 @@
-%% -*- erlang-indent-level: 4; indent-tabs-mode: nil -*-
 -module(aeplugin_dev_mode_handler).
 
 -export([routes/0]).
@@ -7,6 +6,8 @@
         , content_types_provided/2
         , index_html/2
         , json_api/2
+        %% , emit_keyblocks/2
+        %% , emit_microblock/2
         ]).
 
 -import(aeplugin_dev_mode_html, [html/1, meta/0]).
@@ -21,7 +22,6 @@ routes() ->
            , {"/auto_emit_mb/", ?MODULE, []}
            , {"/spend", ?MODULE, []}
            , {"/status", ?MODULE, []}
-           , {"/rollback", ?MODULE, []}
            ]}
     ].
 
@@ -37,15 +37,14 @@ content_types_provided(Req, State) ->
      ], Req#{'$result' => Result}, State}.
 
 json_api(#{'$result' := Result, qs := Qs} = Req, State) ->
-    Response0 = case Result of
-                    ok ->
-                        #{ <<"result">> => <<"ok">> };
-                    {error, Reason} ->
-                        #{ <<"error">> => to_bin(Reason)};
-                    Map when is_map(Map) ->
-                        Map
-                end,
-    Response = chain_status(Response0),
+    Response = case Result of
+                   ok ->
+                       #{ <<"result">> => <<"ok">> };
+                   {error, Reason} ->
+                       #{ <<"error">> => to_bin(Reason)};
+                   Map when is_map(Map) ->
+                       Map
+               end,
     JSON = parse_qs(Qs, [{<<"pp_json">>, boolean, false}],
                     fun(false) ->
                             jsx:encode(Response);
@@ -73,13 +72,11 @@ index_html(Req, State) ->
                  set_mb_interval_form(),
                  auto_emit_mb_form(),
                  spend_form(),
-                 {h4, <<"Rollback">>},
-                 rollback_form(),
                  {hr, []},
-                 {h3, <<"Chain:">>},
+                 {h2, <<"Chain:">>},
                  {p, [<<"Top height: ">>, integer_to_binary(aec_chain:top_height())]},
                  {p, [<<"Mempool size: ">>, integer_to_binary(aec_tx_pool:size())]},
-                 {h4, <<"Account balances">>},
+                 {h3, <<"Account balances">>},
                  accounts_table()
                 ]}
               ]}),
@@ -88,13 +85,15 @@ index_html(Req, State) ->
 accounts_table() ->
     Balances = account_balances(),
     {table,
-     [{tr, [{th, <<"Key">>},
+     [{tr, [{th, <<"Pub Key">>},
+            {th, <<"Priv Key">>},
             {th, <<"Balance">>}]}
      | lists:map(
          fun({K, V}) ->
                  Strong = is_demo_pubkey(K),
                  EncKey = aeser_api_encoder:encode(account_pubkey, K),
                  {tr, [{td, maybe_strong(Strong, EncKey)},
+                       {td, maybe_strong(Strong, privkey_if_demokey(K))},
                        {td, maybe_strong(Strong, integer_to_binary(V))}]}
          end, Balances) ]}.
 
@@ -164,23 +163,15 @@ spend_form() ->
       {input, #{type => submit, value => <<"Spend">>}, []}
      ]}.
 
-rollback_form() ->
-    {form, #{action => <<"/rollback">>, method => get},
-     [{label, #{for => height}, <<"To height: ">>},
-      {input, #{type => text, id => height, name => height}, []},
-      {label, #{for => hash}, <<"To hash: ">>},
-      {input, #{type => text, id => hash, name => hash}, []},
-      {input, #{type => submit, value => <<"Rollback">>}, []}
-     ]}.
-
 maybe_strong(true , Text) -> {strong, Text};
 maybe_strong(false, Text) -> Text.
 
 serve_request(#{path := <<"/emit_kb">>, qs := Qs}) ->
     Params = httpd:parse_query(Qs),
-    OldHeight = aec_chain:top_height(),
-    N = case proplists:get_value(<<"n">>, Params, 1) of
-            1 -> 1;
+    N = case proplists:get_value(<<"n">>, Params, undefined) of
+            undefined ->
+                %% ignore
+                0;
             NStr ->
                 try binary_to_integer(NStr)
                 catch
@@ -191,8 +182,7 @@ serve_request(#{path := <<"/emit_kb">>, qs := Qs}) ->
         0 -> ok;
         _ ->
             aeplugin_dev_mode_emitter:emit_keyblocks(N)
-    end,
-    #{<<"old_height">> => OldHeight};
+    end;
 serve_request(#{path := <<"/kb_interval">>, qs := Qs}) ->
     parse_qs(Qs, [{<<"secs">>, integer, undefined}],
              fun(undefined) ->
@@ -258,30 +248,11 @@ serve_request(#{path := <<"/status">>}) ->
       <<"chain">> =>
           #{
             <<"top_height">> => aec_chain:top_height(),
-            <<"top_hash">> => encoded_top_hash(),
             <<"mempool_height">> => aec_tx_pool:size(),
             <<"all_balances">> => balances_json()
            },
       <<"accounts">> => devmode_accounts()
      };
-serve_request(#{path := <<"/rollback">>, qs := Qs}) ->
-    OldHeight = aec_chain:top_height(),
-    OldHash = encoded_top_hash(),
-    Params = httpd:parse_query(Qs),
-    [H, B] = [proplists:get_value(K, Params, <<>>)
-              || K <- [<<"height">>, <<"hash">>]],
-    {ok, [[Root]]} = init:get_argument(root),
-    Script = filename:join(Root, "bin/aeternity db_rollback"),
-    Cmd = binary_to_list(
-            iolist_to_binary(
-              [Script,
-               [[" -h ", H] || H =/= <<>> ],
-               [[" -b ", B] || B =/= <<>> ]])),
-    lager:debug("Cmd = ~p~n", [Cmd]),
-    Res = os:cmd(Cmd),
-    lager:debug(">> ~s~n", [Res]),
-    #{ <<"old_height">> => OldHeight
-     , <<"old_top">> => OldHash };
 serve_request(_) ->
     ok.
 
@@ -342,6 +313,15 @@ acct(Key) ->
 is_demo_pubkey(K) ->
     lists:keymember(K, 1, demo_keypairs()).
 
+privkey_if_demokey(Pub) ->
+    case is_demo_pubkey(Pub) of
+        true ->
+            {_, Priv} = lists:keyfind(Pub, 1, demo_keypairs()),
+            hexlify(Priv);
+        false ->
+            <<"-">>
+    end.
+
 min_gas_price() ->
     aec_tx_pool:minimum_miner_gas_price().
 
@@ -390,23 +370,3 @@ to_bin(A) when is_atom(A) ->
     atom_to_binary(A, utf8);
 to_bin(X) ->
     iolist_to_binary(io_lib:fwrite("~p", [X])).
-
-chain_status(#{<<"chain">> := _} = Res) ->
-    Res;
-chain_status(Res) ->
-    TopHdr = aec_chain:top_header(),
-    Height = aec_headers:height(TopHdr),
-    Res#{ <<"chain">> => #{ <<"height">> => Height
-                          , <<"top_hash">> => encoded_top_hash(TopHdr) }}.
-
-encoded_top_hash() ->
-    TopHdr = aec_chain:top_header(),
-    encoded_top_hash(TopHdr).
-
-encoded_top_hash(TopHdr) ->
-    {ok, TopHash} = aec_headers:hash_header(TopHdr),
-    Type = case aec_headers:type(TopHdr) of
-               key   -> key_block_hash;
-               micro -> micro_block_hash
-           end,
-    aeser_api_encoder:encode(Type, TopHash).
